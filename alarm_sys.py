@@ -6,10 +6,10 @@ import threading
 from ultralytics import YOLO
 
 PORT_ARDUINO = 'COM3'
-COOLDOWN     = 8
-FADEOUT      = 2
-CONF         = 0.6
-DETECT_EVERY = 3
+COOLDOWN     = 8 #time set for cooldown between alarms
+FADEOUT      = 2 #time that is needed for person to disappear for alarm to go away
+CONF         = 0.6 # ai confidence in detecting humans
+DETECT_EVERY = 3 # frames that yolo detects(efficients)
 
 os.makedirs('recordings', exist_ok=True)
 os.makedirs('snapshots',  exist_ok=True)
