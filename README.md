@@ -3,7 +3,7 @@
 Real-time human detection system using YOLOv8 and OpenCV,
 with automatic recording and Arduino integration.
 
-![demo](demo.gif)
+![demo](presentation.gif)
 
 ## What it does
 
