@@ -48,11 +48,5 @@ The project was designed from scratch using Object-Oriented Programming (OOP) pr
   * `ultralytics`
   * `pyserial`
 
----
 
-## ⚙️ Installation & Setup
 
-**1. Clone the repository:**
-```bash
-git clone [https://github.com/YourUsername/Smart-Security-System.git](https://github.com/YourUsername/Smart-Security-System.git)
-cd Smart-Security-System
