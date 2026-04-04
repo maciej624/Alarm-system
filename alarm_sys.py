@@ -1,155 +1,204 @@
-﻿import cv2
+""" Author : Maciej Drajewski """
+import cv2
 import serial
 import time
 import os
 import threading
 from ultralytics import YOLO
 
-PORT_ARDUINO = 'COM3'
-COOLDOWN     = 8 #time set for cooldown between alarms
-FADEOUT      = 2 #time that is needed for person to disappear for alarm to go away
-CONF         = 0.6 # ai confidence in detecting humans
-DETECT_EVERY = 3 # frames that yolo detects(efficients)
+class Configuration:
+    PORT_ARDUINO = 'COM3'
+    COOLDOWN     = 6     # time between alarms
+    FADEOUT      = 2     # time alarm fades away after not seeing human
+    CONFIDENCE   = 0.65   # Ai confidence
+    DETECT_EVERY = 3     # every frame that YOLO active
 
-os.makedirs('recordings', exist_ok=True)
-os.makedirs('snapshots',  exist_ok=True)
+class Arduino:
+    def __init__(self, port, baudrate=9600):
+        self.ard = None
+        try:
+            self.ard = serial.Serial(port, baudrate, timeout=1)
+            time.sleep(2)
+            print("ARDUINO works")
+        except serial.SerialException:
+            print("ARDUINO disconected")
 
-klatka_do_sprawdzenia = None
-wykryte_boxy          = []
-nowe_wyniki           = False
+    def send(self,message:str):
+        if self.ard:
+            self.ard.write(f"{message}\n".encode()) #sending message to arduino changing msg to numbers with \n     
 
-def watek_yolo():
-    global klatka_do_sprawdzenia, wykryte_boxy, nowe_wyniki
-    print("Loading YOLO")
-    model = YOLO('yolov8n.pt')
-    print("YOLO ready")
+    def close(self):
+        if self.ard:
+            self.send("OK")
+            self.ard.close()
 
-    while True:
-        if klatka_do_sprawdzenia is not None:
-            maly   = cv2.resize(klatka_do_sprawdzenia, (320, 240)) #szybciej dziala YOLO niz na 640x480
-            wyniki = model(maly, verbose=False, conf=CONF, classes=[0])[0]
-            klatka_do_sprawdzenia = None
+class Recorder:
+    def __init__(self):
+        self.rec_dir = 'recordings'
+        self.snap_dir = 'photos'
+        self.writer = None
+        self.file_counter = 0
+        os.makedirs(self.rec_dir, exist_ok=True)
+        os.makedirs(self.snap_dir, exist_ok=True)
+#start recording
+    def start(self):
+        self.file_counter += 1
+        path = f"{self.rec_dir}/alarm_{self.file_counter}.avi"
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        self.writer = cv2.VideoWriter(path, fourcc, 30.0, (640, 480)) #fps and resolution
+        print(f"Recording - {path}")
+#stop curent recording
+    def stop(self):
+        if self.writer:
+            self.writer.release()
+            self.writer = None
+            print("Stoped Recording")
 
-            nowe_boxy = []
-            for box in wyniki.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                nowe_boxy.append((x1 * 2, y1 * 2, x2 * 2, y2 * 2))
+    def write_frame(self, frame):
+        if self.writer:
+            self.writer.write(frame)
+#photo
+    def snapshot(self, frame, alarm_num):
+        path = f"{self.snap_dir}/snap_{alarm_num}.jpg"
+        cv2.imwrite(path, frame)
+        print(f"Took photo  - {path}")
 
-            wykryte_boxy = nowe_boxy
-            nowe_wyniki  = True
+class Yolo:
+    #class responsible for running model in background so there is no issue blockage etc
+    def __init__(self, model_name='yolov8n.pt'):
+        print("Loading yolo model")
+        self.model = YOLO(model_name) #yolov8n.pt
+        print("YOLO is ready")
+        
+        self.frame_to_check = None
+        self.detected_boxes = []
+        self.new_results = False
+        self.running = True
+        self.thread = threading.Thread(target=self._process_loop, daemon=True)
+        self.thread.start()
+
+    def set_frame(self, frame):
+        self.frame_to_check = frame.copy()
+
+    def get_results(self):
+        if self.new_results:
+            self.new_results = False
+            return self.detected_boxes.copy()
+        return None
+
+    def _process_loop(self):
+        while self.running:
+            if self.frame_to_check is not None:
+                small_frame = cv2.resize(self.frame_to_check, (320, 240)) #lower resolution so it runs way faster than on 640x480
+                results = self.model(small_frame, verbose=False, conf=Configuration.CONFIDENCE, classes=[0])[0] #only class 0 with is human
+                self.frame_to_check = None
+
+                new_boxes = []
+                for box in results.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    new_boxes.append((x1 * 2, y1 * 2, x2 * 2, y2 * 2))
+
+                self.detected_boxes = new_boxes
+                self.new_results = True
+            else:
+                time.sleep(0.01)
+
+    def stop(self):
+        self.running = False
+
+class SecuritySystem:
+    def __init__(self):
+        self.arduino = Arduino(Configuration.PORT_ARDUINO)
+        self.recorder = Recorder()
+        self.detector = Yolo()
+        
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        self.alarm_active = False
+        self.last_alarm_time = 0.0
+        self.last_seen_time = 0.0
+        self.human_on_screen = False
+        self.alarm_count = 0
+        self.frame_count = 0
+        self.current_boxes = []
+
+    def run(self):
+        print("\n Press Q to quit")
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+
+            frame = cv2.flip(frame, 1) # mirror flip camera 
+            self.frame_count += 1
+            now = time.time()
+
+            if self.frame_count % Configuration.DETECT_EVERY == 0:
+                self.detector.set_frame(frame)
+
+            boxes = self.detector.get_results()
+            if boxes is not None:
+                if boxes:
+                    self.human_on_screen = True
+                    self.last_seen_time = now
+                    self.current_boxes = boxes
+                else:
+                    if now - self.last_seen_time > Configuration.FADEOUT:
+                        self.human_on_screen = False
+                        self.current_boxes = []
+
+            self._handle_alarm(now, frame)
+
+            self._draw_hud(frame)
+
+            cv2.imshow("Smart Security", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+                
+        self.cleanup()
+
+    def _handle_alarm(self, now, frame):
+        if self.human_on_screen and not self.alarm_active and (now - self.last_alarm_time > Configuration.COOLDOWN):
+            self.alarm_active = True
+            self.last_alarm_time = now
+            self.alarm_count += 1
+            
+            self.arduino.send("ALARM")
+            self.recorder.start()
+            self.recorder.snapshot(frame, self.alarm_count)
+            print(f"Alarm #{self.alarm_count} activated!!")
+
+        elif self.alarm_active and not self.human_on_screen:
+            self.alarm_active = False
+            self.arduino.send("OK")
+            self.recorder.stop()
+            print("Alarm off")
+
+        self.recorder.write_frame(frame)
+
+    def _draw_hud(self, frame):
+        if self.alarm_active:
+            cv2.putText(frame, "!! ALARM !!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
         else:
-            time.sleep(0.01)
+            cv2.putText(frame, "OK", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
 
-nagrywarka    = None
-licznik_plikow = 0
+        cv2.putText(frame, f"Alarms: {self.alarm_count}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
-def start_nagrywania():
-    global nagrywarka, licznik_plikow
-    licznik_plikow += 1
-    nazwa  = f"recordings/alarm_{licznik_plikow}.avi"
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    nagrywarka = cv2.VideoWriter(nazwa, fourcc, 20.0, (640, 480))
-    print(f"[REC] {nazwa}")
+        for (x1, y1, x2, y2) in self.current_boxes:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(frame, "Person", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-def stop_nagrywania():
-    global nagrywarka
-    if nagrywarka is not None:
-        nagrywarka.release()
-        nagrywarka = None
-        print("[REC] stopped")
+    def cleanup(self):
+        print("Turning off . ..")
+        self.recorder.stop()
+        self.detector.stop()
+        self.cap.release()
+        cv2.destroyAllWindows()
+        self.arduino.close()
 
-def zrob_zdjecie(frame, nr):
-    cv2.imwrite(f"snapshots/snap_{nr}.jpg", frame)
-    print(f"[SNAP] snap_{nr}.jpg")
-
-try:
-    ard = serial.Serial(PORT_ARDUINO, 9600, timeout=1)
-    time.sleep(2)
-    print("Arduino OK")
-except serial.SerialException:
-    ard = None
-    print("no Arduino")
-
-threading.Thread(target=watek_yolo, daemon=True).start()
-
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-alarm_aktywny       = False
-ostatni_alarm       = 0.0
-ostatnio_widziany   = 0.0
-czlowiek_na_ekranie = False
-licznik_alarmow     = 0
-nr_klatki           = 0
-aktualne_ramki      = []
-
-print("press Q to quit")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    frame     = cv2.flip(frame, 1)
-    nr_klatki += 1
-    teraz     = time.time()
-
-    if nr_klatki % DETECT_EVERY == 0:
-        klatka_do_sprawdzenia = frame.copy()
-
-    if nowe_wyniki:
-        boxy        = wykryte_boxy.copy()
-        nowe_wyniki = False
-    else:
-        boxy = None
-
-    if boxy is not None:
-        if boxy:
-            czlowiek_na_ekranie = True
-            ostatnio_widziany   = teraz
-            aktualne_ramki      = boxy
-        else:
-            if teraz - ostatnio_widziany > FADEOUT:
-                czlowiek_na_ekranie = False
-                aktualne_ramki      = []
-
-    if czlowiek_na_ekranie and not alarm_aktywny and teraz - ostatni_alarm > COOLDOWN:
-        alarm_aktywny   = True
-        ostatni_alarm   = teraz
-        licznik_alarmow += 1
-        if ard: ard.write(b"ALARM\n")
-        start_nagrywania()
-        zrob_zdjecie(frame, licznik_alarmow)
-        print(f"ALARM #{licznik_alarmow}")
-
-    elif alarm_aktywny and not czlowiek_na_ekranie:
-        alarm_aktywny = False
-        if ard: ard.write(b"OK\n")
-        stop_nagrywania()
-        print("OK - cleared")
-
-    if nagrywarka is not None:
-        nagrywarka.write(frame)
-
-    if alarm_aktywny:
-        cv2.putText(frame, "!! ALARM !!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-    else:
-        cv2.putText(frame, "OK", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-
-    cv2.putText(frame, f"Alarms: {licznik_alarmow}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-
-    for (x1, y1, x2, y2) in aktualne_ramki:
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(frame, "Person", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-    cv2.imshow("Alarm", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-stop_nagrywania()
-cap.release()
-cv2.destroyAllWindows()
-if ard:
-    ard.write(b"OK\n")
-    ard.close()
+if __name__ == "__main__":
+    app = SecuritySystem()
+    app.run()
